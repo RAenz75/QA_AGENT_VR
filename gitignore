@@ -2,3 +2,5 @@
 /APK/PROD
 /APK/TEST
 *.apk
+.DS_Store
+docs/
