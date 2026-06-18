@@ -1,3 +1,4 @@
 .env
 /APK/PROD
 /APK/TEST
+*.apk
