@@ -25,22 +25,70 @@ Demande systématiquement à l'utilisateur :
 ## Protocole de démarrage
 
 ```bash
-# 1. Vérifier la connexion
-adb devices
+# Tout-en-un : vérif ADB, création dossiers, launch app, mesure startup
+eval $(./scripts/session_init.sh <APP_PACKAGE>)
+# → exporte $SESSION_ID pour les commandes suivantes
 
-# 2. Vérifier que l'app est installée
-adb shell pm list packages | grep <APP_PACKAGE>
+# Lancement des agents de surveillance en parallèle (sessions standard/longue)
+./scripts/collect_metrics.sh <APP_PACKAGE> $SESSION_ID &
+./scripts/watch_stability.sh <APP_PACKAGE> $SESSION_ID &
+```
 
-# 3. Créer le dossier de session
-SESSION_ID="session_$(date +%Y%m%d_%H%M%S)"
-mkdir -p output/$SESSION_ID/{screenshots,logs,metrics}
+## Protocole de communication inter-agents
 
-# 4. Lancer l'app
-adb shell monkey -p <APP_PACKAGE> -c android.intent.category.LAUNCHER 1
+### Fichiers de statut (écrits par chaque agent)
 
-# 5. Attendre le démarrage (mesurer le temps)
-# Surveiller logcat jusqu'à "ActivityManager: Displayed <APP_PACKAGE>"
-adb logcat -d | grep "Displayed.*<APP_PACKAGE>"
+Chaque agent spécialisé **doit écrire** son statut dans :
+```
+output/$SESSION_ID/agent_status/<nom_agent>.json
+```
+
+Format attendu :
+```json
+{
+  "agent": "stability-watcher",
+  "status": "running",
+  "last_update": "14:32:05",
+  "summary": "0 crash — 0 ANR — surveillance active",
+  "alert_level": "ok"
+}
+```
+
+Valeurs de `status` : `starting` | `running` | `alert` | `done` | `error`
+Valeurs de `alert_level` : `ok` | `warning` | `critical`
+
+### File d'alertes (écrite par les agents, lue par l'orchestrateur)
+
+Les agents écrivent les alertes urgentes dans :
+```
+output/$SESSION_ID/alerts.queue
+```
+
+Format d'une ligne d'alerte :
+```
+[HH:MM:SS][AGENT][NIVEAU] message
+```
+
+Exemples :
+```
+[14:35:12][perf-monitor][CRITICAL] FPS=18 pendant 3 cycles consécutifs
+[14:38:44][stability-watcher][CRITICAL] CRASH DÉTECTÉ — voir logs/crash_dump_143844.log
+[14:42:00][perf-monitor][WARNING] Mémoire RSS=1.6 GB — seuil alerte dépassé
+```
+
+### Lecture des alertes par l'orchestrateur
+
+```bash
+# Lire et vider la file d'alertes
+ALERTS_FILE="output/$SESSION_ID/alerts.queue"
+if [ -s "$ALERTS_FILE" ]; then
+    cat "$ALERTS_FILE"
+    > "$ALERTS_FILE"   # vider après lecture
+fi
+
+# Lire le statut d'un agent spécifique
+cat output/$SESSION_ID/agent_status/stability-watcher.json
+cat output/$SESSION_ID/agent_status/perf-monitor.json
 ```
 
 ## Plan de session selon durée
@@ -76,10 +124,12 @@ adb logcat -d | grep "Displayed.*<APP_PACKAGE>"
 Tu délègues via le tool `Agent` en spécifiant le `subagent_type` correspondant au `name` de l'agent cible. Fournis toujours dans le prompt de délégation :
 
 ```
-Agent cible : <nom>          # Valeurs valides : ui-explorer | perf-monitor | stability-watcher | report-writer
+Agent cible : <nom>
 Session ID : <SESSION_ID>
 Package : <APP_PACKAGE>
 Durée allouée : <N> minutes
+Fichier de statut à écrire : output/<SESSION_ID>/agent_status/<nom>.json
+Fichier d'alertes : output/<SESSION_ID>/alerts.queue
 Paramètres spécifiques : <...>
 ```
 
@@ -87,14 +137,55 @@ Pour les phases parallèles (ex: `perf-monitor` + `stability-watcher` simultané
 
 ## Supervision en cours de session
 
-- Interroger `stability-watcher` toutes les 10 minutes pour un statut crash/ANR
-- Interroger `perf-monitor` pour vérifier que les métriques restent dans les seuils (cf. CLAUDE.md)
-- Si un seuil critique est dépassé → suspendre les tests UI, documenter, alerter
+```bash
+# Boucle de supervision — à relancer toutes les 10 minutes
+CHECK_INTERVAL=600  # secondes
+
+while true; do
+    # 1. Lire les alertes
+    ALERTS_FILE="output/$SESSION_ID/alerts.queue"
+    if [ -s "$ALERTS_FILE" ]; then
+        echo "=== ALERTES EN ATTENTE ==="
+        cat "$ALERTS_FILE"
+        > "$ALERTS_FILE"
+    fi
+
+    # 2. Vérifier l'état de chaque agent
+    for AGENT in stability-watcher perf-monitor ui-explorer; do
+        STATUS_FILE="output/$SESSION_ID/agent_status/${AGENT}.json"
+        if [ -f "$STATUS_FILE" ]; then
+            LEVEL=$(grep -o '"alert_level": "[^"]*"' "$STATUS_FILE" | cut -d'"' -f4)
+            SUMMARY=$(grep -o '"summary": "[^"]*"' "$STATUS_FILE" | cut -d'"' -f4)
+            echo "[$AGENT] $LEVEL — $SUMMARY"
+            if [ "$LEVEL" = "critical" ]; then
+                echo "⚠️ ACTION REQUISE sur $AGENT"
+            fi
+        fi
+    done
+
+    sleep $CHECK_INTERVAL
+done
+```
+
+Règles de supervision :
+- `alert_level: critical` sur n'importe quel agent → suspendre les tests UI, documenter, alerter l'utilisateur
+- `status: error` → investiguer et relancer l'agent si possible
+- App crashée (signalé par stability-watcher) → relancer l'app, incrémenter le compteur de crashes
 
 ## Fin de session
 
-1. Arrêter tous les agents actifs
-2. Fermer l'app proprement : `adb shell am force-stop <APP_PACKAGE>`
-3. Récupérer les artefacts finaux de chaque agent
-4. Invoquer `report-writer` avec le chemin `output/$SESSION_ID/`
-5. Présenter le rapport à l'utilisateur
+```bash
+# Kill les boucles background, ferme l'app, pull artefacts, nettoie /sdcard
+./scripts/stop_session.sh $SESSION_ID <APP_PACKAGE>
+
+# 5. Invoquer report-writer
+```
+
+Invoquer `report-writer` avec :
+```
+Session ID : <SESSION_ID>
+Package : <APP_PACKAGE>
+Durée réelle : <N> minutes
+Agents actifs : [ui-explorer, perf-monitor, stability-watcher]
+Chemin session : output/<SESSION_ID>/
+```

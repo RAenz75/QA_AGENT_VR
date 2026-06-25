@@ -10,27 +10,53 @@ tools: Bash, Read, Write
 
 Tu surveilles en continu la stabilité de l'app via logcat. Tu détectes les crashes, ANR (Application Not Responding), exceptions non gérées et comportements anormaux. Chaque incident est documenté avec sa trace complète.
 
-## Démarrage de la surveillance
+## Protocole de communication avec l'orchestrateur
 
-### Logcat filtré sur l'app
+### Écriture du statut
+
+À chaque vérification (toutes les 60 secondes), mettre à jour :
+
 ```bash
-# Récupérer le PID de l'app
-PID=$(adb shell pidof <APP_PACKAGE>)
-echo "PID de l'app : $PID"
-
-# Logcat filtré sur ce PID (toute la session)
-adb logcat --pid=$PID -v threadtime > output/$SESSION_ID/logs/logcat_app.log &
-
-# Logcat global pour crashes système (crash du processus = plus de PID)
-adb logcat -v threadtime *:E AndroidRuntime:E ActivityManager:I > output/$SESSION_ID/logs/logcat_system.log &
+cat > output/$SESSION_ID/agent_status/stability-watcher.json << EOF
+{
+  "agent": "stability-watcher",
+  "status": "running",
+  "last_update": "$(date +%H:%M:%S)",
+  "summary": "${CRASH_COUNT} crash — ${ANR_COUNT} ANR — surveillance active",
+  "alert_level": "$ALERT_LEVEL"
+}
+EOF
 ```
 
-### Tags critiques à surveiller
+### Envoi d'alertes à l'orchestrateur
+
 ```bash
-# Surveillance en temps réel des événements critiques
-adb logcat -v time | grep -E \
-  "AndroidRuntime|FATAL|ANR|OutOfMemory|NullPointer|ActivityManager.*crash|beginning of crash" \
-  > output/$SESSION_ID/logs/logcat_critical.log &
+ALERTS_FILE="output/$SESSION_ID/alerts.queue"
+
+# En cas de crash
+echo "[$(date +%H:%M:%S)][stability-watcher][CRITICAL] CRASH DÉTECTÉ — voir logs/crash_dump_$TIMESTAMP.log" >> "$ALERTS_FILE"
+
+# En cas d'ANR
+echo "[$(date +%H:%M:%S)][stability-watcher][WARNING] ANR détecté dans <APP_PACKAGE>" >> "$ALERTS_FILE"
+
+# Si le processus meurt
+echo "[$(date +%H:%M:%S)][stability-watcher][CRITICAL] PROCESSUS MORT — app fermée de façon inattendue" >> "$ALERTS_FILE"
+```
+
+`ALERT_LEVEL` :
+- `ok` — aucun incident
+- `warning` — ANR ou avertissement OOM
+- `critical` — crash ou processus mort
+
+## Démarrage de la surveillance
+
+```bash
+# Lancer la surveillance complète (logcat + détection + santé processus) en background
+./scripts/watch_stability.sh <APP_PACKAGE> $SESSION_ID &
+
+# Logs écrits dans output/$SESSION_ID/logs/
+# PIDs dans output/$SESSION_ID/logs/watcher.pid
+# Arrêt via stop_session.sh ou : kill $(cat output/$SESSION_ID/logs/watcher.pid)
 ```
 
 ## Détection de crash
